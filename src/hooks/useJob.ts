@@ -34,8 +34,8 @@ export function useJobs(userId: string | undefined) {
 
     const unsubscribe = onSnapshot(
       q,
-      (snap) => {
-        const jobs: Job[] = snap.docs.map((d) => {
+      (snap: any) => {
+        const jobs: Job[] = snap.docs.map((d: any) => {
           const data = d.data()
           return {
             id: d.id,
@@ -48,7 +48,7 @@ export function useJobs(userId: string | undefined) {
         setJobs(jobs)
         setLoading(false)
       },
-      (err) => {
+      (err: any) => {
         console.error('Jobs listener error:', err)
         setLoading(false)
       }

@@ -21,6 +21,33 @@ export function uploadAudioToStorage(
   onError?: (error: Error) => void,
   onComplete?: (result: StorageUploadResult) => void
 ): UploadTask {
+  if (userId && userId.startsWith('demo-')) {
+    const objectUrl = URL.createObjectURL(file)
+    let currentPct = 0
+    const step = 25
+    const interval = setInterval(() => {
+      currentPct += step
+      const transferred = Math.round((Math.min(currentPct, 100) / 100) * file.size)
+      onProgress?.(Math.min(currentPct, 100), transferred, file.size)
+      if (currentPct >= 100) {
+        clearInterval(interval)
+        onComplete?.({
+          storagePath: `demo/${folder}/${file.name}`,
+          downloadUrl: objectUrl,
+          fileName: file.name,
+          size: file.size,
+        })
+      }
+    }, 150)
+
+    return {
+      cancel: () => clearInterval(interval),
+      on: () => {},
+      then: () => {},
+      catch: () => {},
+    } as unknown as UploadTask
+  }
+
   const timestamp = Date.now()
   const sanitizedName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_')
   const storagePath = `users/${userId}/${folder}/${timestamp}_${sanitizedName}`
@@ -32,13 +59,13 @@ export function uploadAudioToStorage(
 
   uploadTask.on(
     'state_changed',
-    (snapshot) => {
+    (snapshot: any) => {
       const pct = Math.round(
         (snapshot.bytesTransferred / snapshot.totalBytes) * 100
       )
       onProgress?.(pct, snapshot.bytesTransferred, snapshot.totalBytes)
     },
-    (error) => {
+    (error: any) => {
       console.error('Upload error:', error)
       onError?.(new Error(error.message))
     },
@@ -61,6 +88,9 @@ export function uploadAudioToStorage(
 }
 
 export async function getFileDownloadUrl(storagePath: string): Promise<string> {
+  if (storagePath.startsWith('demo/') || storagePath.startsWith('blob:')) {
+    return storagePath
+  }
   const storageRef = ref(storage, storagePath)
   return getDownloadURL(storageRef)
 }

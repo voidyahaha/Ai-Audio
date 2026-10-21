@@ -37,7 +37,7 @@ export default function VocalMixer() {
     uploadFile: uploadInst, error: instError
   } = useUpload()
 
-  const { jobs, addJob } = useAppStore()
+  const { jobs, addJob, updateJob } = useAppStore()
   const { startPolling } = useJobPolling(activeJobId)
 
   const mixJobs = jobs.filter(j => j.type === 'vocal_mix')
@@ -84,6 +84,51 @@ export default function VocalMixer() {
       if (!instResult) { toast.error('Instrumental upload failed', { id: 'mix-toast' }); return }
 
       toast.loading('Starting mix...', { id: 'mix-toast' })
+
+      if (user.uid.startsWith('demo-')) {
+        const jobId = 'demo-mix-' + Date.now()
+        setActiveJobId(jobId)
+
+        const demoJob: Job = {
+          id: jobId,
+          userId: user.uid,
+          type: 'vocal_mix',
+          status: 'queued',
+          progress: 15,
+          statusMessage: 'Aligning vocals to instrumental tempo...',
+          originalFileName: vocalFile?.name || 'recording.webm',
+          originalStoragePath: vocalResult.storagePath,
+          vocalStoragePath: vocalResult.storagePath,
+          instrumentalStoragePath: instResult.storagePath,
+          mixedTrackUrl: vocalResult.downloadUrl,
+          stems: [],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }
+
+        addJob(demoJob)
+        setExpandedJobId(jobId)
+        setVocalFile(null)
+        setInstrumentalFile(null)
+        setRecordedBlob(null)
+        toast.success('Vocal mix started! 🎛️', { id: 'mix-toast' })
+
+        setTimeout(() => {
+          updateJob(jobId, { status: 'mixing', progress: 65, statusMessage: 'Applying pitch correction and EQ...' })
+        }, 1500)
+
+        setTimeout(() => {
+          updateJob(jobId, {
+            status: 'completed',
+            progress: 100,
+            statusMessage: 'Mixed successfully!',
+            completedAt: new Date(),
+          })
+          toast.success('Mix complete! Ready for playback.')
+        }, 3500)
+
+        return
+      }
 
       const jobRef = await addDoc(collection(db, 'jobs'), {
         userId: user.uid,

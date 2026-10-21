@@ -34,6 +34,22 @@ export default function Analyzer() {
       if (!uploaded) { toast.error('Upload failed', { id: 'analyze' }); return }
 
       toast.loading('Analyzing audio...', { id: 'analyze' })
+
+      if (user.uid.startsWith('demo-')) {
+        await new Promise((r) => setTimeout(r, 1200))
+        setResult({
+          bpm: 124,
+          key: 'C Major',
+          duration: 180,
+          loudness: -14.2,
+          sampleRate: 44100,
+          beats: [0.5, 1.0, 1.5, 2.0],
+          onsets: [0.2, 0.7, 1.2, 1.7],
+        })
+        toast.success('Analysis complete!', { id: 'analyze' })
+        return
+      }
+
       const data = await api.analyzeAudio(uploaded.storagePath)
       setResult(data.analysis)
       toast.success('Analysis complete!', { id: 'analyze' })

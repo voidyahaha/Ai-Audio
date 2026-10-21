@@ -61,6 +61,63 @@ export default function Separator() {
         return
       }
 
+      // In Local Demo / Guest mode, simulate separation without cloud backend
+      if (user.uid.startsWith('demo-')) {
+        const jobId = 'demo-job-' + Date.now()
+        setActiveJobId(jobId)
+
+        const demoJob: Job = {
+          id: jobId,
+          userId: user.uid,
+          type: 'separation',
+          status: 'queued',
+          progress: 10,
+          statusMessage: 'Job queued for processing',
+          originalFileName: selectedFile.name,
+          originalStoragePath: uploadResult.storagePath,
+          originalDownloadUrl: uploadResult.downloadUrl,
+          stems: [],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }
+
+        addJob(demoJob)
+        setExpandedJobId(jobId)
+        setStep('done')
+        setSelectedFile(null)
+        toast.success('Separation started! 🎵', { id: 'sep-toast' })
+
+        setTimeout(() => {
+          updateJob(jobId, { status: 'processing', progress: 40, statusMessage: 'Extracting audio frequencies...' })
+        }, 1200)
+
+        setTimeout(() => {
+          updateJob(jobId, { status: 'separating', progress: 75, statusMessage: 'Isolating Vocals, Drums, Bass & Other...' })
+        }, 2600)
+
+        setTimeout(() => {
+          const audioUrl = uploadResult.downloadUrl
+          updateJob(jobId, {
+            status: 'completed',
+            progress: 100,
+            statusMessage: 'Completed',
+            completedAt: new Date(),
+            bpm: 124,
+            key: 'C Major',
+            duration: 180,
+            stems: [
+              { stem: 'vocals', storagePath: uploadResult.storagePath, downloadUrl: audioUrl, duration: 180, sampleRate: 44100, sizBytes: uploadResult.size },
+              { stem: 'drums', storagePath: uploadResult.storagePath, downloadUrl: audioUrl, duration: 180, sampleRate: 44100, sizBytes: uploadResult.size },
+              { stem: 'bass', storagePath: uploadResult.storagePath, downloadUrl: audioUrl, duration: 180, sampleRate: 44100, sizBytes: uploadResult.size },
+              { stem: 'other', storagePath: uploadResult.storagePath, downloadUrl: audioUrl, duration: 180, sampleRate: 44100, sizBytes: uploadResult.size },
+            ],
+          })
+          toast.success('Stem separation complete! Audio tracks are ready.')
+        }, 4500)
+
+        return
+      }
+
       toast.loading('Starting separation...', { id: 'sep-toast' })
 
       // 2. Create job in Firestore

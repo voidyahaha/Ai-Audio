@@ -12,7 +12,7 @@ export default function AuthPage() {
   const [password, setPassword] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
-  const { signInEmail, signUpEmail, signInGoogle, resetPassword, authError, setAuthError, user, loading } = useAuth()
+  const { signInEmail, signUpEmail, signInGoogle, resetPassword, continueAsGuest, authError, setAuthError, user, loading } = useAuth()
   const navigate = useNavigate()
 
   useEffect(() => {
@@ -219,6 +219,20 @@ export default function AuthPage() {
               ) : mode === 'signin' ? 'Sign In' : mode === 'signup' ? 'Create Account' : 'Send Reset Email'}
             </button>
           </form>
+
+          {/* Guest / Demo Mode Button */}
+          <div className="mt-4">
+            <button
+              type="button"
+              onClick={() => {
+                continueAsGuest()
+                navigate('/')
+              }}
+              className="w-full py-2.5 px-4 rounded-xl border border-accent-primary/40 bg-accent-primary/10 hover:bg-accent-primary/20 text-accent-primary font-medium text-sm transition-all flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <span>⚡</span> Continue as Guest (Test Local Site)
+            </button>
+          </div>
 
           {/* Mode switcher */}
           <div className="mt-6 text-center text-sm">
