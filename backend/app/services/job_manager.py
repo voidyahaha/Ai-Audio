@@ -10,10 +10,29 @@ import os
 import shutil
 import threading
 import time
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Optional
 from loguru import logger
+
+# Each background thread gets its own dedicated event loop so that
+# _run_async() / loop.run_until_complete() never conflicts with the
+# main FastAPI event loop or with other threads.
+_thread_loop: threading.local = threading.local()
+
+def _get_thread_loop() -> asyncio.AbstractEventLoop:
+    """Return (and lazily create) a per-thread event loop."""
+    loop = getattr(_thread_loop, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _thread_loop.loop = loop
+    return loop
+
+def _run_async(coro):
+    """Run a coroutine synchronously in this thread's dedicated event loop."""
+    return _get_thread_loop().run_until_complete(coro)
 
 from app.config import settings
 from app.services.firebase_service import (
@@ -35,6 +54,22 @@ from app.services.mixing import (
 _executor = ThreadPoolExecutor(max_workers=settings.MAX_CONCURRENT_JOBS)
 _active_jobs: Dict[str, threading.Event] = {}
 _active_jobs_lock = threading.Lock()
+
+
+def _verify_audio_file(path: str) -> None:
+    """Fail the job if FFmpeg cannot parse a non-empty output."""
+    if not os.path.isfile(path) or os.path.getsize(path) < 1000:
+        raise RuntimeError(f"Audio output is missing or empty: {path}")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, timeout=60,
+    )
+    try:
+        if probe.returncode != 0 or float(probe.stdout.strip()) <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise RuntimeError(f"Audio output is not playable: {path}")
 
 
 def get_active_job_count() -> int:
@@ -70,7 +105,7 @@ def run_separation_job(
         _run_separation(job_id, user_id, storage_path, model, work_dir, cancel_event)
     except Exception as e:
         logger.exception(f"[{job_id}] Separation job crashed: {e}")
-        asyncio.run(update_job_status(
+        _run_async(update_job_status(
             job_id, "failed", 0,
             f"Processing failed: {str(e)[:200]}",
             {"error": str(e)[:500]}
@@ -95,18 +130,18 @@ def _run_separation(job_id, user_id, storage_path, model, work_dir, cancel_event
 
     def progress(pct, msg):
         check_cancel()
-        asyncio.run(update_job_status(job_id, "separating", pct, msg))
+        _run_async(update_job_status(job_id, "separating", pct, msg))
 
     logger.info(f"[{job_id}] Starting separation job | model={model}")
 
     # 1. Update status: processing
-    asyncio.run(update_job_status(job_id, "processing", 5, "Downloading source audio..."))
+    _run_async(update_job_status(job_id, "processing", 10, "Audio ready. Preparing workspace..."))
     check_cancel()
 
-    # 2. Download source file from Firebase Storage
+    # 2. Download source file from Firebase Storage / local storage
     input_ext = os.path.splitext(storage_path)[1] or ".mp3"
     input_path = os.path.join(work_dir, f"input{input_ext}")
-    asyncio.run(download_from_storage(storage_path, input_path))
+    _run_async(download_from_storage(storage_path, input_path))
 
     if not os.path.exists(input_path) or os.path.getsize(input_path) < 100:
         raise RuntimeError(f"Downloaded file is missing or empty: {input_path}")
@@ -114,22 +149,25 @@ def _run_separation(job_id, user_id, storage_path, model, work_dir, cancel_event
     logger.info(f"[{job_id}] Downloaded: {input_path} ({os.path.getsize(input_path)//1024}KB)")
 
     # 3. Audio analysis (BPM, key, duration)
-    asyncio.run(update_job_status(job_id, "processing", 12, "Analyzing audio (BPM, key)..."))
+    _run_async(update_job_status(job_id, "processing", 15, "Analyzing audio rhythm and structure..."))
     check_cancel()
 
     analysis = {}
+    analysis_start = time.time()
     try:
-        analysis = analyze_audio(input_path)
+        analysis = analyze_audio(input_path, fast=True)
         logger.info(f"[{job_id}] Analysis: BPM={analysis.get('bpm')}, key={analysis.get('key')}")
     except Exception as e:
         logger.warning(f"[{job_id}] Analysis failed (non-fatal): {e}")
+    finally:
+        logger.info(f"[{job_id}] Fast metadata analysis took {time.time() - analysis_start:.1f}s")
 
     # 4. Run Demucs separation
     stems_dir = os.path.join(work_dir, "stems")
     os.makedirs(stems_dir, exist_ok=True)
 
     check_cancel()
-    asyncio.run(update_job_status(job_id, "separating", 20, f"Loading AI model ({model})..."))
+    _run_async(update_job_status(job_id, "separating", 20, f"Loading AI model ({model})..."))
 
     stem_files = separate_audio(
         input_path=input_path,
@@ -144,15 +182,13 @@ def _run_separation(job_id, user_id, storage_path, model, work_dir, cancel_event
     check_cancel()
 
     # 5. Upload stems to Firebase Storage
-    asyncio.run(update_job_status(job_id, "separating", 88, "Uploading stems to storage..."))
+    _run_async(update_job_status(job_id, "separating", 88, "Uploading stems to storage..."))
 
     stems_data = []
     for stem_name, local_path in stem_files.items():
         check_cancel()
 
-        if not os.path.exists(local_path) or os.path.getsize(local_path) < 1000:
-            logger.warning(f"[{job_id}] Stem {stem_name} missing or too small, skipping")
-            continue
+        _verify_audio_file(local_path)
 
         stem_info = get_stem_info(local_path)
 
@@ -170,7 +206,7 @@ def _run_separation(job_id, user_id, storage_path, model, work_dir, cancel_event
             upload_ext = ".wav"
 
         storage_stem_path = f"users/{user_id}/stems/{job_id}/{stem_name}{upload_ext}"
-        download_url = asyncio.run(upload_to_storage(
+        download_url = _run_async(upload_to_storage(
             upload_local_path, storage_stem_path, content_type
         ))
 
@@ -180,18 +216,19 @@ def _run_separation(job_id, user_id, storage_path, model, work_dir, cancel_event
             "downloadUrl": download_url,
             "duration": stem_info.get("duration"),
             "sampleRate": stem_info.get("sample_rate"),
-            "sizBytes": stem_info.get("size_bytes"),
+            "sizeBytes": stem_info.get("size_bytes"),
         })
 
     if not stems_data:
         raise RuntimeError("No stems were successfully uploaded")
 
     # 6. Mark completed
-    asyncio.run(update_job_status(
+    _run_async(update_job_status(
         job_id, "completed", 100,
         f"Separation complete! {len(stems_data)} stems ready",
         {
             "stems": stems_data,
+            "analysis": analysis,
             "bpm": analysis.get("bpm"),
             "key": analysis.get("key"),
             "duration": analysis.get("duration"),
@@ -227,7 +264,7 @@ def run_vocal_mix_job(
         )
     except Exception as e:
         logger.exception(f"[{job_id}] Vocal mix job crashed: {e}")
-        asyncio.run(update_job_status(
+        _run_async(update_job_status(
             job_id, "failed", 0,
             f"Mixing failed: {str(e)[:200]}",
             {"error": str(e)[:500]}
@@ -249,7 +286,7 @@ def _run_vocal_mix(
 
     def status(pct, msg, state="mixing"):
         check_cancel()
-        asyncio.run(update_job_status(job_id, state, pct, msg))
+        _run_async(update_job_status(job_id, state, pct, msg))
 
     logger.info(f"[{job_id}] Starting vocal mix")
 
@@ -262,8 +299,8 @@ def _run_vocal_mix(
     vocal_local = os.path.join(work_dir, f"vocal{vocal_ext}")
     inst_local = os.path.join(work_dir, f"instrumental{inst_ext}")
 
-    asyncio.run(download_from_storage(vocal_storage_path, vocal_local))
-    asyncio.run(download_from_storage(instrumental_storage_path, inst_local))
+    _run_async(download_from_storage(vocal_storage_path, vocal_local))
+    _run_async(download_from_storage(instrumental_storage_path, inst_local))
 
     for f in [vocal_local, inst_local]:
         if not os.path.exists(f) or os.path.getsize(f) < 100:
@@ -281,12 +318,13 @@ def _run_vocal_mix(
 
     # 3. Analyze BPM of both
     try:
-        inst_bpm, _, _ = get_bpm_and_beats(inst_wav)
-        vocal_bpm, _, _ = get_bpm_and_beats(vocal_wav)
+        inst_bpm, inst_beats, _ = get_bpm_and_beats(inst_wav)
+        vocal_bpm, vocal_beats, _ = get_bpm_and_beats(vocal_wav)
         logger.info(f"[{job_id}] Vocal BPM={vocal_bpm:.1f}, Inst BPM={inst_bpm:.1f}")
     except Exception as e:
         logger.warning(f"[{job_id}] BPM detection failed: {e}")
         inst_bpm, vocal_bpm = 120.0, 120.0
+        inst_beats, vocal_beats = [], []
 
     check_cancel()
 
@@ -320,16 +358,15 @@ def _run_vocal_mix(
     mixed_mp3 = os.path.join(work_dir, "mixed.mp3")
     encode_to_mp3(mixed_wav, mixed_mp3, bitrate=settings.FINAL_BITRATE)
 
-    if not os.path.exists(mixed_mp3) or os.path.getsize(mixed_mp3) < 1000:
-        raise RuntimeError("Final mix file is missing or empty after encoding")
+    _verify_audio_file(mixed_mp3)
 
     # 8. Upload
     status(90, "Uploading final mix...", "mixing")
     storage_mix_path = f"users/{user_id}/mixes/{job_id}/mixed.mp3"
-    download_url = asyncio.run(upload_to_storage(mixed_mp3, storage_mix_path, "audio/mpeg"))
+    download_url = _run_async(upload_to_storage(mixed_mp3, storage_mix_path, "audio/mpeg"))
 
     # 9. Done
-    asyncio.run(update_job_status(
+    _run_async(update_job_status(
         job_id, "completed", 100,
         "Mix complete! Your track is ready.",
         {
@@ -337,6 +374,13 @@ def _run_vocal_mix(
             "mixedTrackUrl": download_url,
             "vocalBpm": vocal_bpm,
             "instrumentalBpm": inst_bpm,
+            "analysis": {
+                "vocalBpm": vocal_bpm,
+                "instrumentalBpm": inst_bpm,
+                "vocalBeats": vocal_beats[:200],
+                "instrumentalBeats": inst_beats[:200],
+                "pitchPreserved": bool(do_time_stretch),
+            },
         }
     ))
     logger.info(f"[{job_id}] Vocal mix COMPLETE")

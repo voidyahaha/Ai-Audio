@@ -14,6 +14,17 @@ from typing import Optional
 from app.config import settings
 
 
+def _load_audio_file(file_path: str):
+    """Load audio file as (channels, samples) array and sample rate."""
+    try:
+        data, sr = sf.read(file_path)
+        y = data.T if data.ndim > 1 else data
+        return y, sr
+    except Exception:
+        import librosa
+        return librosa.load(file_path, sr=None, mono=False)
+
+
 def mix_vocal_with_instrumental(
     vocal_path: str,
     instrumental_path: str,
@@ -39,20 +50,19 @@ def mix_vocal_with_instrumental(
     logger.info(f"Mixing: vocal_gain={vocal_gain}, inst_gain={instrumental_gain}")
 
     # Load both files
-    y_vocal, sr_v = librosa.load(vocal_path, sr=None, mono=False)
-    y_inst, sr_i = librosa.load(instrumental_path, sr=None, mono=False)
+    y_vocal, sr_v = _load_audio_file(vocal_path)
+    y_inst, sr_i = _load_audio_file(instrumental_path)
 
-    # Resample vocal if SR differs
+    # Resample vocal if SR differs using ffmpeg
     target_sr = sr_i
     if sr_v != sr_i:
         logger.info(f"Resampling vocal {sr_v}Hz -> {sr_i}Hz")
-        if y_vocal.ndim == 1:
-            y_vocal = librosa.resample(y_vocal, orig_sr=sr_v, target_sr=sr_i)
-        else:
-            y_vocal = np.stack([
-                librosa.resample(y_vocal[ch], orig_sr=sr_v, target_sr=sr_i)
-                for ch in range(y_vocal.shape[0])
-            ])
+        tmp_resampled = vocal_path + ".resampled.wav"
+        cmd = ["ffmpeg", "-y", "-i", vocal_path, "-ar", str(target_sr), "-c:a", "pcm_s24le", tmp_resampled]
+        subprocess.run(cmd, check=True, capture_output=True)
+        y_vocal, sr_v = _load_audio_file(tmp_resampled)
+        if os.path.exists(tmp_resampled):
+            os.remove(tmp_resampled)
 
     # Convert mono to stereo if needed
     def ensure_stereo(audio: np.ndarray) -> np.ndarray:
@@ -104,11 +114,10 @@ def normalize_loudness(audio: np.ndarray, target_lufs: float = -14.0) -> np.ndar
         if rms < 1e-8:
             return audio
 
-        # Convert target LUFS to linear gain (simplified)
-        import librosa
-        current_db = librosa.amplitude_to_db(rms, ref=1.0)
+        # Linear gain calculation
+        current_db = float(20.0 * np.log10(max(rms, 1e-9)))
         gain_db = target_lufs - current_db
-        gain_linear = librosa.db_to_amplitude(gain_db)
+        gain_linear = 10.0 ** (gain_db / 20.0)
 
         # Apply gain with ceiling
         normalized = audio * gain_linear

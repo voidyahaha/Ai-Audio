@@ -18,6 +18,8 @@ class StemType(str, Enum):
     bass = "bass"
     other = "other"
     instrumental = "instrumental"
+    piano = "piano"
+    guitar = "guitar"
 
 class StemFile(BaseModel):
     stem: StemType
@@ -44,7 +46,7 @@ class Job(BaseModel):
     key: Optional[str] = None
     duration: Optional[float] = None
     error: Optional[str] = None
-    model: str = "htdemucs_ft"
+    model: str = "htdemucs"
     vocal_storage_path: Optional[str] = None
     instrumental_storage_path: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -57,7 +59,7 @@ class SeparationRequest(BaseModel):
     job_id: str
     user_id: str
     storage_path: str
-    model: str = "htdemucs_ft"
+    model: str = "htdemucs"
 
 class MixRequest(BaseModel):
     job_id: str
@@ -85,4 +87,6 @@ class HealthResponse(BaseModel):
     gpu_available: bool
     demucs_model: str
     active_jobs: int
+    device: str = "cpu"
+    cpu_threads: int = 1
     version: str = "1.0.0"

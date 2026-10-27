@@ -13,14 +13,20 @@ class Settings(BaseSettings):
     # Firebase Admin
     FIREBASE_PROJECT_ID: str = "vocal-separater-5eb7c"
     FIREBASE_CREDENTIALS_PATH: str = ""  # Path to service account JSON
+    FIREBASE_SERVICE_ACCOUNT_JSON: str = ""  # Optional JSON secret for container platforms
     FIREBASE_STORAGE_BUCKET: str = "vocal-separater-5eb7c.firebasestorage.app"
 
     # Processing
-    DEMUCS_MODEL: str = "htdemucs_ft"  # Best quality model
-    DEMUCS_SHIFTS: int = 1             # Number of random shifts (quality vs speed)
-    DEMUCS_OVERLAP: float = 0.25       # Chunk overlap
+    DEMUCS_DEVICE: str = "auto"
+    DEMUCS_MODEL: str = "htdemucs"     # Fast four-stem default
+    DEMUCS_SHIFTS: int = 0             # One inference pass is fastest
+    DEMUCS_OVERLAP: float = 0.25       # Used on GPU; CPU path disables overlap
+    DEMUCS_CPU_THREADS: int = min(8, os.cpu_count() or 1)
     PROCESSING_TEMP_DIR: str = "/tmp/stemai_processing"
-    MAX_CONCURRENT_JOBS: int = 2
+    AUDIO_DATA_DIR: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    MAX_CONCURRENT_JOBS: int = 1
+    MAX_UPLOAD_MB: int = 250
+    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
 
     # Audio
     OUTPUT_FORMAT: str = "wav"         # Internal processing format
@@ -37,9 +43,11 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     USE_CELERY: bool = False           # False = use asyncio background tasks
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    model_config = {
+        "env_file": ".env",
+        "case_sensitive": True,
+        "extra": "ignore",  # Allow extra env vars like DEMUCS_DEVICE
+    }
 
 @lru_cache()
 def get_settings() -> Settings:
@@ -47,5 +55,6 @@ def get_settings() -> Settings:
 
 settings = get_settings()
 
-# Ensure temp dir exists
+# Ensure dirs exist
 Path(settings.PROCESSING_TEMP_DIR).mkdir(parents=True, exist_ok=True)
+Path(settings.AUDIO_DATA_DIR).mkdir(parents=True, exist_ok=True)

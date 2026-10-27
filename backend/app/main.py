@@ -3,18 +3,28 @@ StemAI Backend — FastAPI application entry point.
 """
 
 import sys
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from app.config import settings
 from app.services.firebase_service import init_firebase
 from app.api.routes import router
 
+# Path to built frontend
+_FRONTEND_DIST = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "..", "frontend", "dist"
+)
+_FRONTEND_DIST = os.path.normpath(_FRONTEND_DIST)
+
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
+os.makedirs("logs", exist_ok=True)
 logger.remove()
 logger.add(
     sys.stdout,
@@ -43,8 +53,8 @@ async def lifespan(app: FastAPI):
 
     # Initialize Firebase
     try:
-        init_firebase()
-        logger.info("  Firebase     : ✓ connected")
+        firebase_app = init_firebase()
+        logger.info(f"  Firebase     : {'✓ connected' if firebase_app else '✗ not configured'}")
     except Exception as e:
         logger.error(f"  Firebase     : ✗ {e}")
         logger.warning("  Running without Firebase — some features will fail")
@@ -67,18 +77,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow frontend origins
-ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "https://*.vercel.app",
-    "https://vocal-separater-5eb7c.web.app",
-    "https://vocal-separater-5eb7c.firebaseapp.com",
+# CORS — restrict browser access to explicitly configured frontend origins.
+cors_origins = [
+    origin.strip()
+    for origin in settings.CORS_ORIGINS.split(",")
+    if origin.strip()
 ]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],         # Tighten in production to ALLOWED_ORIGINS
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,7 +98,10 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.exception(f"Unhandled error on {request.url}: {exc}")
     return JSONResponse(
         status_code=500,
-        content={"success": False, "error": str(exc)},
+        # Exceptions can contain storage paths, provider responses, or other
+        # operational detail. Keep that in server logs and return a stable,
+        # safe message to clients.
+        content={"success": False, "error": "Internal server error"},
     )
 
 
@@ -99,14 +109,48 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(router)
 
 
-@app.get("/")
-async def root():
-    return {
-        "name": "StemAI API",
-        "version": "1.0.0",
-        "status": "running",
-        "docs": "/docs",
-    }
+# ── Serve built React frontend or API info ──────────────────────────────────
+if os.path.isdir(_FRONTEND_DIST):
+    # Serve static assets (JS, CSS, images) from /assets
+    app.mount("/assets", StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")), name="assets")
+
+    # Serve favicon
+    @app.get("/favicon.svg")
+    async def favicon():
+        fav = os.path.join(_FRONTEND_DIST, "favicon.svg")
+        if os.path.isfile(fav):
+            return FileResponse(fav)
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    # Root: serve index.html for React Frontend
+    @app.get("/")
+    async def root_index():
+        index = os.path.join(_FRONTEND_DIST, "index.html")
+        if os.path.isfile(index):
+            return FileResponse(index)
+        return JSONResponse({"error": "Frontend not built"}, status_code=404)
+
+    # Catch-all: serve index.html for React Router (SPA)
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # Don't catch API routes or documentation as frontend routes.
+        if full_path.startswith("api") or full_path.startswith("docs") or full_path.startswith("openapi") or full_path.startswith("listen"):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        index = os.path.join(_FRONTEND_DIST, "index.html")
+        if os.path.isfile(index):
+            return FileResponse(index)
+        return JSONResponse({"error": "Frontend not built"}, status_code=404)
+
+    logger.info(f"Serving frontend from: {_FRONTEND_DIST}")
+else:
+    @app.get("/")
+    async def root():
+        return {
+            "name": "StemAI API",
+            "version": "1.0.0",
+            "status": "running",
+            "docs": "/docs",
+        }
 
 
 # ── Dev runner ────────────────────────────────────────────────────────────────

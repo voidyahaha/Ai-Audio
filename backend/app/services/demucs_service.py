@@ -5,9 +5,8 @@ Never pretends to have separated anything — verifies output files exist before
 """
 
 import os
-import shutil
+import threading
 import torch
-from pathlib import Path
 from loguru import logger
 from typing import Callable, Optional, Dict, List
 import time
@@ -15,10 +14,32 @@ import time
 from app.config import settings
 
 # Detect hardware
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-GPU_AVAILABLE = torch.cuda.is_available()
+_requested_device = settings.DEMUCS_DEVICE.lower()
+if _requested_device == "auto":
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+elif _requested_device == "cuda" and not torch.cuda.is_available():
+    logger.warning("DEMUCS_DEVICE=cuda requested but CUDA is unavailable; falling back to CPU")
+    DEVICE = "cpu"
+elif _requested_device in {"cpu", "cuda"}:
+    DEVICE = _requested_device
+else:
+    raise ValueError("DEMUCS_DEVICE must be set to auto, cpu, or cuda")
+GPU_AVAILABLE = DEVICE == "cuda" and torch.cuda.is_available()
+CPU_THREADS = max(1, int(settings.DEMUCS_CPU_THREADS))
+
+if DEVICE == "cpu":
+    torch.set_num_threads(CPU_THREADS)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch only permits setting inter-op threads once per process.
+        pass
 
 logger.info(f"Demucs: device={DEVICE}, GPU={GPU_AVAILABLE}")
+logger.info(f"Demucs CPU threads: {CPU_THREADS}")
+
+_MODEL_CACHE = {}
+_MODEL_CACHE_LOCK = threading.Lock()
 
 STEM_MAP = {
     "htdemucs": ["vocals", "drums", "bass", "other"],
@@ -33,7 +54,7 @@ def get_available_stems(model_name: str) -> List[str]:
 def separate_audio(
     input_path: str,
     output_dir: str,
-    model_name: str = "htdemucs_ft",
+    model_name: str = "htdemucs",
     on_progress: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, str]:
     """
@@ -51,7 +72,11 @@ def separate_audio(
     from demucs.apply import apply_model, BagOfModels
     from demucs.audio import AudioFile, save_audio
     from demucs.pretrained import get_model
-    import torchaudio
+
+    # Keep CPU jobs on the faster four-stem model.
+    if DEVICE == "cpu" and model_name == "htdemucs_ft":
+        logger.info("Auto-selecting fast 'htdemucs' model for CPU processing")
+        model_name = "htdemucs"
 
     logger.info(f"Starting separation: model={model_name}, device={DEVICE}")
     logger.info(f"Input: {input_path}")
@@ -67,16 +92,27 @@ def separate_audio(
     try:
         # Load model
         if on_progress:
-            on_progress(5, f"Loading {model_name} model...")
+            on_progress(18, f"Initializing AI model ({model_name})...")
 
-        logger.info(f"Loading Demucs model: {model_name}")
-        model = get_model(model_name)
-        model.to(DEVICE)
-        model.eval()
-        logger.info(f"Model loaded in {time.time() - start_time:.1f}s")
+        model_load_start = time.time()
+        cached_model = False
+        with _MODEL_CACHE_LOCK:
+            model = _MODEL_CACHE.get(model_name)
+            if model is None:
+                logger.info(f"Loading Demucs model: {model_name}")
+                model = get_model(model_name)
+                model.to(DEVICE)
+                model.eval()
+                _MODEL_CACHE[model_name] = model
+            else:
+                cached_model = True
+        logger.info(
+            f"Model ready in {time.time() - model_load_start:.1f}s "
+            f"(cached={cached_model})"
+        )
 
         if on_progress:
-            on_progress(15, "Loading audio file...")
+            on_progress(22, "Preparing audio for separation...")
 
         # Load audio
         wav = AudioFile(input_path).read(
@@ -87,46 +123,75 @@ def separate_audio(
 
         # wav shape: (channels, samples)
         ref = wav.mean(0)
-        wav = (wav - ref.mean()) / ref.std()
+        # A silent or nearly-silent file has zero variance.  Do not allow it
+        # to create NaNs that make Demucs fail with an opaque model error.
+        ref_std = ref.std().clamp_min(1e-8)
+        wav = (wav - ref.mean()) / ref_std
         wav = wav.unsqueeze(0)  # Add batch dim: (1, channels, samples)
 
+        total_samples = wav.shape[-1]
         logger.info(f"Audio loaded: shape={wav.shape}, sr={model.samplerate}")
 
         if on_progress:
-            on_progress(25, "Separating stems with AI (this takes a while)...")
+            on_progress(25, "Separating stems with AI (25%)...")
 
-        # Run separation
-        with torch.no_grad():
+        last_reported_pct = [25]
+        last_reported_time = [time.time()]
+        def chunk_progress_callback(d):
+            offset = d.get("segment_offset", 0)
+            model_idx = d.get("model_idx_in_bag", 0)
+            num_models = d.get("models", 1)
+            chunk_ratio = min(1.0, max(0.0, offset / max(1, total_samples)))
+            overall_ratio = (model_idx + chunk_ratio) / max(1, num_models)
+            pct = int(25 + overall_ratio * 55)
+            now = time.time()
+            # Frequent progress updates (every 1% if at least 2s elapsed) so UI moves smoothly
+            if pct > last_reported_pct[0] and (now - last_reported_time[0] >= 2.0 or pct >= last_reported_pct[0] + 2):
+                last_reported_pct[0] = pct
+                last_reported_time[0] = now
+                if on_progress:
+                    on_progress(pct, f"Separating audio with AI ({pct}%)...")
+
+        # CPU inference uses one pass and no overlap to reduce latency.
+        shifts = 0 if DEVICE == "cpu" else settings.DEMUCS_SHIFTS
+        overlap = 0.0 if DEVICE == "cpu" else settings.DEMUCS_OVERLAP
+
+        inference_start = time.time()
+        with torch.inference_mode():
             if isinstance(model, BagOfModels):
-                # Multiple models — track progress per model
                 sources = apply_model(
                     model,
                     wav,
                     device=DEVICE,
-                    shifts=settings.DEMUCS_SHIFTS,
+                    shifts=shifts,
                     split=True,
-                    overlap=settings.DEMUCS_OVERLAP,
-                    progress=True,
+                    overlap=overlap,
+                    progress=False,
                     num_workers=0,
+                    callback=chunk_progress_callback,
                 )
             else:
                 sources = apply_model(
                     model,
                     wav,
                     device=DEVICE,
-                    shifts=settings.DEMUCS_SHIFTS,
+                    shifts=shifts,
                     split=True,
-                    overlap=settings.DEMUCS_OVERLAP,
-                    progress=True,
+                    overlap=overlap,
+                    progress=False,
+                    callback=chunk_progress_callback,
                 )
 
-        logger.info(f"Separation completed in {time.time() - start_time:.1f}s")
+        logger.info(
+            f"Model inference completed in {time.time() - inference_start:.1f}s "
+            f"(total so far {time.time() - start_time:.1f}s)"
+        )
 
         if on_progress:
             on_progress(80, "Saving stem files...")
 
         # Denormalize
-        sources = sources * ref.std() + ref.mean()
+        sources = sources * ref_std + ref.mean()
 
         # Save each stem
         stem_names = model.sources
@@ -152,9 +217,6 @@ def separate_audio(
         if "vocals" in output_files and len(output_files) > 1:
             if on_progress:
                 on_progress(88, "Generating instrumental mix...")
-
-            import torchaudio
-            import torch
 
             non_vocal_sources = [
                 sources[0, i]
